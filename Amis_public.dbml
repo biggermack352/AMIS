@@ -1,0 +1,803 @@
+// ==========================================
+// AMIS Unified Schema
+// ==========================================
+
+Table part_catalog {
+  part_uuid varchar [primary key, note: 'UUID Generated via Python']
+  part_number varchar [not null]
+  dash_number varchar [not null]
+  part_name varchar [not null]
+  system_category varchar [note: 'e.g., Airframe, Propulsion, Avionics, ARS']
+  sub_system_category varchar [note: 'e.g., Flight controls, Front Frame']
+  sub_sub_system_category varchar [note: 'e.g., Flight controls, Front Frame']
+  nha_part_uuid varchar [note: 'Self-referential link to Parent Part']
+  is_life_limited bool [note: 'Yes or no']
+  stock_number varchar [unique]
+  OEM varchar
+  unit_cost float [note: 'The wholesale cost of the part']
+  Note: 'The Master Catalog. Contains everything from the entire Airframe down to a washer.'
+}
+
+// Self-referential relationship for the Engineering BOM (What should be)
+Ref: part_catalog.nha_part_uuid > part_catalog.part_uuid
+
+Table part_life_limit {
+  limit_uuid varchar [primary key]
+  part_uuid varchar [ref: > part_catalog.part_uuid]
+  disposition varchar [note: 'e.g., Retire, Overhaul, Repair']
+  limit_unit varchar [note: 'HOURS, Landings']
+  max_threshold float [not null, note: 'The engineering limit (e.g., 2000.0)']
+  remarks varchar 
+  Note: 'Defines the maximum life threshold rules for part numbers.'
+}
+
+Table asset_instance {
+  asset_uuid varchar [primary key, note: 'UUID Generated via Python']
+  part_uuid varchar [ref: > part_catalog.part_uuid]
+  serial_number varchar [unique, not null, note: 'Tail number for Aircraft, S/N for Components']
+  manufacture_date date
+  parent_asset_uuid varchar [note: 'Self-referential link tracking physical installation hierarchy']
+  offset_hours_or_landings float [note: 'A way to log received life.']
+  Note: 'Physical hardware inventory. The top record is the Tail number itself.'
+}
+
+// Self-referential relationship for Physical Installation (What actually is)
+Ref: asset_instance.parent_asset_uuid > asset_instance.asset_uuid
+
+Table asset_installation_history {
+  install_uuid varchar [primary key]
+  parent_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The NHA it was installed into']
+  child_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific component installed']
+  install_date timestamptz [not null]
+  removal_date timestamptz [note: 'NULL means it is currently installed']
+  Note: 'Preserves the entire history of what S/N was on what aircraft at what time.'
+}
+
+Table asset_status_log {
+  log_uuid varchar [primary key]
+  asset_uuid varchar [ref: > asset_instance.asset_uuid]
+  status_code varchar [note: 'flyable, nf, AWP (Awaiting Parts)']
+  effective_date timestamptz
+  end_date timestamptz [note: 'Calculated via ETL or explicitly logged when status ends']
+  duration_hours float [note: 'Calculated: DATEDIFF in hours between effective_date and end_date']
+  driving_discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'The Discrepancy that caused the down status']
+  remarks text
+Note: 'Chronological ledger of aircraft readiness.'
+}
+
+Table maintenance_discrepancy {
+  discrepancy_uuid varchar [primary key]
+  aircraft_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'Points to the Tail number asset instance']
+  suspected_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'Lower-level S/N if known (Nullable)']
+  discovered_date timestamptz [not null]
+  narrative text [note: 'Plain English pilot/maintainer description']
+  severity_level varchar [note: 'Critical, Major, Minor']
+  related_faults varchar [ref: > triggered_fault_log.event_uuid]
+  Note: 'Discrepancy reports tied strictly to a validated, serialized Tail number.'
+}
+
+Table maintenance_action {
+  action_uuid varchar [primary key]
+  discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid]
+  asset_removed_uuid varchar [ref: > asset_instance.asset_uuid, note: 'Asset S/N removed']
+  asset_installed_uuid varchar [ref: > asset_instance.asset_uuid, note: 'Asset S/N installed']
+  completed_date timestamptz
+  corrective_action_text text
+  performed_by_uuid varchar [ref: > maintainer.maintainer_uuid, note: 'The technician who did the work']
+  inspected_by_uuid varchar [ref: > maintainer.maintainer_uuid, note: 'The QA who signed off the work']
+  Note: 'The execution loop. Logs physical asset swaps on the aircraft.'
+}
+
+Table cybernetic_feedback_loop {
+  loop_uuid varchar [primary key]
+  discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid]
+  action_uuid varchar [ref: > maintenance_action.action_uuid]
+  model_prediction_accuracy float [note: 'AI Model accuracy score for this specific failure']
+  anomaly_score_at_failure float [note: 'Raw telemetry anomaly score from Data']
+  adaptation_decision text [note: 'How the AMIS adjusted its thresholds based on this event']
+}
+
+Table technical_directive {
+  td_uuid varchar [primary key]
+  td_number varchar [unique, not null]
+  td_type varchar [note: 'Airframe Change, Avionics Bulletin, etc.']
+  issue_date date
+  title text
+  target_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The new PN/Dash configuration the TD creates']
+  old_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The old PN/Dash configuration the TD deletes']
+  Note: 'The engineering authority dictating the configuration change.'
+}
+
+Table td_compliance_log {
+  compliance_uuid varchar [primary key]
+  td_uuid varchar [ref: > technical_directive.td_uuid]
+  pre_mod_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The original asset before rework']
+  post_mod_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The new asset instance created after rework']
+  completion_date timestamptz
+  action_uuid varchar [ref: > maintenance_action.action_uuid, note: 'The maintenance action where the work was executed']
+  Note: 'The genealogy table. Proves that Old Asset X was physically transformed into New Asset Y.'
+}
+
+Table design_problem_report {
+  pr_uuid varchar [primary key]
+  jira_ticket_id varchar [unique, not null]
+  part_uuid varchar [ref: > part_catalog.part_uuid, note: 'Linked to the abstract engineering design, not a physical S/N']
+  reported_date timestamptz
+  issue_summary text [note: 'Plain text of the Jira ticket title/description']
+  root_cause_analysis text [note: 'Engineering resolution text']
+  status varchar [note: 'Open, In Review, Closed - Fixed']
+  Note: 'Captures developmental testing and design flaws to seed the AMIS.'
+}
+
+Table operating_limit {
+  op_limit_uuid varchar [primary key]
+  limit_number varchar [unique, not null]
+  title varchar [not null]
+  type varchar [note: 'Operating Limitation or Advisory']
+  status varchar [note: 'Approved, Draft, Retired']
+  justification text
+  limitation_narrative text [note: 'The detailed explanation of the limit']
+  exceedance_instructions text
+  removal_actions text
+  system_category varchar [note: 'e.g., PPSE, STRC, AVSE']
+  Note: 'The master directory for all operating limitations.'
+}
+
+Table op_limit_parameter {
+  parameter_uuid varchar [primary key]
+  op_limit_uuid varchar [ref: > operating_limit.op_limit_uuid]
+  parameter_name varchar [not null, note: 'e.g., Creator/Initiator, System Effectivity']
+  parameter_value text [not null]
+  Note: 'Stores the key-value metadata from the Excel template for each limit.'
+}
+
+Table op_limit_attachment {
+  attachment_uuid varchar [primary key]
+  op_limit_uuid varchar [ref: > operating_limit.op_limit_uuid]
+  attachment_name varchar [not null, note: 'e.g., Attachment 1, Figure 2']
+  attachment_type varchar [note: 'Data Table, Chart Image, PDF, etc.']
+  storage_location varchar [note: 'Path to the file in AWS S3']
+  Note: 'Links op limits to their supporting data files, charts, and documents.'
+}
+
+Table flight_log {
+  flight_uuid varchar [primary key]
+  aircraft_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'Tied to the specific Tail number']
+  flight_date date [not null]
+  flight_hours float [not null, note: 'Flight duration in hours (e.g., 2.4)']
+  landings_field integer [default: 0, note: 'Touch-and-go or full-stop field landings']
+  flight_narrative text
+  Note: 'The master flight activity log.'
+}
+
+Table fault_code_master {
+  fault_code_uuid varchar [primary key]
+  fault_code varchar [unique, not null, note: 'e.g., ENG-0402, HYD-109']
+  description text [not null]
+  system_category varchar [note: 'Propulsion, Hydraulics, Avionics']
+  baseline_severity varchar [note: 'Critical, Advisory, Maintenance']
+  related_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The NHA or component this code monitors']
+  
+  Note: 'The master dictionary of all possible fault codes.'
+}
+
+Table triggered_fault_log {
+  event_uuid varchar [primary key]
+  aircraft_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The Tail number']
+  fault_code_uuid varchar [ref: > fault_code_master.fault_code_uuid]
+  flight_uuid varchar [ref: > flight_log.flight_uuid, note: 'Nullable, if it happened on deck']
+  trigger_timestamp timestamptz [not null]
+  clear_timestamp timestamptz [note: 'When the fault turned off. NULL if still active.']
+  duration_seconds float [note: 'Calculated time the fault remained active']
+  Note: 'The raw, machine-generated log of every time a fault code goes active. STORAGE ENGINE: Hybrid/Delta Lake. High-frequency telemetry payloads back-ended in S3 Parquet format.'
+}
+
+Table maintainer {
+  maintainer_uuid varchar [primary key]
+  employee_id varchar [unique, not null, note: 'Synthetic ID to avoid storing real PII']
+  first_name varchar
+  last_name varchar
+  workcenter varchar [note: 'e.g., Power Plants, Airframe, Avionics']
+  Note: 'Roster of authorized fleet maintenance personnel.'
+}
+
+Table qualification_log {
+  qual_uuid varchar [primary key]
+  qual_code varchar [unique, not null]
+  qual_name varchar [not null, note: 'e.g., Power Plants, Quality Assurance Inspector']
+  recertification_interval_months integer [note: 'Syllabus expiration timeline']
+  Note: 'Dictionary of qualifications, schools, and task certifications imported from LMS.'
+}
+
+Table maintainer_qualification_ledger {
+  ledger_uuid varchar [primary key]
+  maintainer_uuid varchar [ref: > maintainer.maintainer_uuid]
+  qual_uuid varchar [ref: > qualification_log.qual_uuid]
+  earned_date date [not null]
+  expiration_date date [note: 'Calculated based on LMS requirements']
+  is_suspended boolean [default: false, note: 'Allows grounding a maintainer if qualification is revoked']
+  Note: 'The ledger tracking who holds what active LMS qualifications.'
+}
+
+Table tech_manual_pub {
+  tech_manual_uuid varchar [primary key]
+  publication_number varchar [unique, not null]
+  publication_type varchar [not null, note: 'Flight manual, Maintenance , Wiring Manual']
+  title varchar [not null]
+  revision_date date
+  file_reference varchar [note: 'Pointer to the file package']
+  Note: 'The master record for a technical publication, including the flight manual'
+}
+
+Table data_module {
+  dm_uuid varchar [primary key]
+  tech_manual_uuid varchar [ref: > tech_manual_pub.tech_manual_uuid]
+  dm_code varchar [unique, not null]
+  title varchar [note: 'e.g., Remove and Install Main Landing Gear']
+  related_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The part this DM applies to']
+  Note: 'Individual tasks/modules.'
+}
+
+Table engineering_investigation {
+  ei_uuid varchar [primary key]
+  report_number varchar [unique, not null]
+  discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'The field failure that triggered the EI']
+  failed_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific serialized part being investigated']
+  submission_date date
+  investigating_activity varchar
+  status varchar [note: 'Open, Closed']
+  findings_summary text
+  Note: 'Tracks physical hardware investigations initiated from the flight line.'
+}
+
+Table tech_manual_change_request {
+  tech_manual_change_request_uuid varchar [primary key]
+  report_number varchar [unique, not null]
+  dm_uuid varchar [ref: > data_module.dm_uuid, note: 'The specific task module containing the error']
+  submitter_uuid varchar [ref: > maintainer.maintainer_uuid, note: 'The tech who found the manual error']
+  submission_date date
+  category varchar [note: 'Safety/Grounded, Routine']
+  deficiency_description text [note: 'What is wrong with the manual?']
+  status varchar [note: 'Submitted, Approved, Incorporated']
+  Note: 'eficiency Reports linked directly to the Data Module.'
+}
+
+Table tech_manual_change_report {
+  tmcr_uuid varchar [primary key]
+  tmcr_number varchar [unique, not null]
+  dm_uuid varchar [ref: > data_module.dm_uuid, note: 'The Data Module being drafted/updated']
+  source_data_reference text [note: 'Engineering drawings or OEM source data driving the update']
+  status varchar
+  Note: 'Technical Manual Source Data Record (Drafting Phase).'
+}
+
+Table engineering_instruction {
+  instruction_uuid varchar [primary key]
+  tracking_number varchar [unique, not null]
+  instruction_type varchar
+  discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'The field issue driving the request']
+  aircraft_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific Tail number affected']
+  
+  // The Request
+  submitted_date timestamptz
+  submitter_uuid varchar [ref: > maintainer.maintainer_uuid]
+  request_narrative text [note: 'Description of damage exceeding limits']
+  
+  // The Answer
+  response_date timestamptz
+  engineer_name varchar [note: 'Name of the engineer']
+  engineering_disposition text [note: 'The custom repair instructions']
+  
+  Note: 'Captures the engineering instruction loop between the fleet and the engineers.'
+}
+
+Table engineering_deviation_log {
+  deviation_log_uuid varchar [primary key]
+  aircraft_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific Tail number flying with the deviation']
+  action_uuid varchar [ref: > maintenance_action.action_uuid, note: 'The maintenance event where the was applied']
+  
+  // Links to either a Engineering instruction
+  instruction_uuid varchar [ref: > engineering_instruction.instruction_uuid, note: 'Nullable']
+  
+  applied_date timestamptz
+  cleared_date timestamptz [note: 'NULL if the aircraft is still flying with this temporary deviation']
+  
+  Note: 'Tracks which Tail numbers are currently operating under non-standard  engineering instructions.'
+}
+
+Table engineering_project {
+  project_uuid varchar [primary key]
+  project_id varchar [unique, note: 'Local tracking number or Excel row ID, e.g., ENG-PROJ-2025-01']
+  project_title varchar [not null]
+  lead_engineer varchar [note: 'Name or UUID of the engineer running the project']
+  status varchar [note: 'Proposed, Active, On Hold, Completed, Cancelled']
+  priority varchar [note: 'High, Medium, Low']
+  start_date date
+  target_completion_date date
+  project_description text [note: 'Plain English summary of what the project is trying to achieve']
+  expected_outcome text [note: 'e.g., Increase MTBF by 15%, Reduce maintenance man-hours']
+  Note: 'Tracks ad-hoc, proactive engineering initiatives and studies.'
+}
+
+Table project_impact_link {
+  link_uuid varchar [primary key]
+  project_uuid varchar [ref: > engineering_project.project_uuid]
+  
+  // A project can impact multiple different entities in the schema
+  impacted_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'Nullable. If the project targets a specific hardware design']
+  impacted_dm_uuid varchar [ref: > data_module.dm_uuid, note: 'Nullable. If the project aims to rewrite a procedure']
+  impacted_fault_code_uuid varchar [ref: > fault_code_master.fault_code_uuid, note: 'Nullable. If the project targets a nuisance BIT code']
+  
+  Note: 'Links the unstructured engineering project to the hard data architecture of the.'
+}
+
+Table amis_model_inference {
+  inference_uuid varchar [primary key]
+  discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'The field issue the AI analyzed']
+  model_version varchar [note: 'e.g., Discrepancy_Classifier_v2.1']
+  inference_timestamp timestamptz
+  
+  // The AI's Output
+  recommended_action varchar [note: 'e.g., REPLACE_PART, INSPECT_ONLY, NO_ACTION_REQUIRED']
+  recommended_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The specific NHA the AI thinks is broken (Nullable)']
+  confidence_score float [note: '0.0 to 1.0 (e.g., 0.85)']
+  ai_rationale text [note: 'The plain English explanation generated by the LLM or ML decision tree']
+  
+  Note: 'Captures the exact prediction made by the AMIS Python scripts/models at the time of the event.'
+}
+
+Table sme_override_report {
+  override_uuid varchar [primary key]
+  inference_uuid varchar [ref: > amis_model_inference.inference_uuid, note: 'The AI prediction being overridden']
+  sme_uuid varchar [ref: > maintainer.maintainer_uuid, note: 'The Engineer/Maintainer making the override decision']
+  override_timestamp timestamptz
+  
+  // The Human's Correction
+  actual_action_taken varchar [note: 'What the SME actually decided to do (e.g., NO_ACTION_REQUIRED)']
+  override_reason_code varchar [note: 'e.g., FALSE_POSITIVE, MISSING_CONTEXT, INCORRECT_PART_IDENTIFIED']
+  sme_rationale text [note: 'Plain English explanation of why the AI was wrong']
+  
+  Note: 'The second-order cybernetic feedback. Used explicitly to retrain the ML models.'
+}
+
+Table fmea_document {
+  fmea_uuid varchar [primary key]
+  part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The NHA this FMEA covers']
+  document_number varchar [note: 'e.g., FMEA-SYS100']
+  revision_letter varchar [note: 'e.g., Rev -, Rev A, Rev B']
+  approval_date date [not null]
+  is_active boolean [default: true, note: 'Only one revision can be active at a time per part']
+  approving_engineer varchar [note: 'The SME who signed off on the revision']
+  Note: 'Version control for the FMEA baseline document.'
+}
+
+Table fmea_failure_mode {
+  mode_uuid varchar [primary key]
+  fmea_uuid varchar [ref: > fmea_document.fmea_uuid, note: 'Links this mode to a specific FMEA revision']
+  failure_mode_description varchar [note: 'e.g., Actuator Rod Snaps, Seal Leaks']
+  
+  // The HRI Matrix Components
+  severity_score integer [note: '1 (Minor) to 5 (Catastrophic)']
+  probability_score integer [note: '1 (Improbable) to 5 (Frequent)']
+  calculated_hri integer [note: 'Usually Severity * Probability']
+  
+  Note: 'The engineering baseline risk assessment (FMECA) for critical parts.'
+}
+
+Table reliability_model_parameters {
+  model_uuid varchar [primary key]
+  part_uuid varchar [ref: > part_catalog.part_uuid]
+ 
+  // Temporal Validity (Version Control)
+  effective_start_date timestamptz [not null, note: 'When this model became active']
+  effective_end_date timestamptz [note: 'NULL if it is the current active model. Populated when superseded.']
+  
+  // Model Metadata
+  model_version varchar [note: 'e.g., WEIBULL_v1.0, WEIBULL_v1.1']
+  data_points_used integer [note: 'How many failure events were used to calculate this curve']
+  
+  
+  // Weibull Parameters
+  weibull_beta float [note: 'Shape parameter: <1 (Infant), =1 (Random), >1 (Wear-out)']
+  weibull_eta float [note: 'Scale parameter: Characteristic life (time to 63.2% failure)']
+  
+  // MTBF (Mean Time Between Failures)
+  calculated_mtbf_hours float
+  
+  Note: 'Stores the mathematical outputs of the RCM models generated by Python.'
+}
+
+Table asset_health_prediction_ledger {
+  prediction_uuid varchar [primary key]
+  asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific serialized part']
+  prediction_timestamp timestamptz [note: 'When the ML model ran']
+  
+  // The Output of the Predictive Models (Weibull + Markov + Telemetry)
+  current_health_score float [note: '0.0 (Failed) to 1.0 (Perfect Health)']
+  probability_of_failure_next_flight float [note: 'Markov transition probability (e.g., 0.05 or 5%)']
+  predicted_remaining_useful_life_hours float [note: 'Dynamic RUL based on wear, distinct from the hard engineering limit']
+  
+  Note: 'The daily/hourly predictive health ledger for every critical physical asset.'
+}
+
+Table fracas_investigation {
+  fracas_uuid varchar [primary key]
+  fracas_tracking_number varchar [unique, not null, note: 'e.g., FRACAS-2025-089']
+  part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The engineering design under review']
+  investigation_status varchar [note: 'Open, Under Analysis, Root Cause Identified, Closed']
+  opened_date timestamptz
+  closed_date timestamptz
+  lead_investigator varchar [ref: > maintainer.maintainer_uuid, note: 'The  Engineer assigned']
+  problem_statement text [note: 'e.g., "Actuator -103 failing 3x faster than Weibull prediction"']
+  Note: 'The master record tracking the engineering analysis phase of FRACAS.'
+}
+
+Table fracas_evidence_link {
+  link_uuid varchar [primary key]
+  fracas_uuid varchar [ref: > fracas_investigation.fracas_uuid]
+  
+  // The Evidence (Can be multiple records linked to one FRACAS)
+  discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'Nullable. A specific flight line failure.']
+  ei_uuid varchar [ref: > engineering_investigation.ei_uuid, note: 'Nullable. A formal physical teardown report.']
+  
+  Note: 'Links the engineering investigation to the hard evidence from the fleet.'
+}
+
+Table fracas_rcca {
+  rcca_uuid varchar [primary key]
+  fracas_uuid varchar [ref: > fracas_investigation.fracas_uuid]
+  determination_date timestamptz
+  
+  // The Root Cause
+  root_cause_category varchar [note: 'Design Flaw, Manufacturing Defect, Maintenance Error, Software Bug']
+  root_cause_narrative text [note: 'The detailed engineering explanation']
+  
+  // The Corrective Action (The Cybernetic Output)
+  corrective_action_type varchar [note: 'Issue TD, Update FMEA, Rewrite  DM, Update Software']
+  
+  // Pointers to the Execution (Closes the Cybernetic Loop)
+  resulting_td_uuid varchar [ref: > technical_directive.td_uuid, note: 'Nullable. If a TD was issued.']
+  resulting_fmea_uuid varchar [ref: > fmea_document.fmea_uuid, note: 'Nullable. If the baseline risk was updated.']
+  resulting_project_uuid varchar [ref: > engineering_project.project_uuid, note: 'Nullable. If it spawned an engineering project.']
+  
+  Note: 'The formal Root Cause and Corrective Action determination.'
+}
+
+Table sensor_catalog {
+  sensor_uuid varchar [primary key]
+  sensor_name varchar [not null, note: 'e.g., L_ENG_VIB_01, HYD_SYS_PRESS_A']
+  monitored_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The NHA this sensor is observing']
+  sensor_type varchar [note: 'Vibration, Temperature, Pressure, Voltage']
+  Note: 'Dictionary of HUMS sensors.'
+}
+
+Table condition_indicator_log {
+  ci_uuid varchar [primary key]
+  sensor_uuid varchar [ref: > sensor_catalog.sensor_uuid]
+  flight_uuid varchar [ref: > flight_log.flight_uuid, note: 'The flight where the data was captured']
+  asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific serialized part being monitored']
+  
+  // The Extracted Metric
+  ci_name varchar [note: 'e.g., RMS_Vibration, Max_Temp_Exceedance']
+  ci_value float [not null, note: 'The numerical value extracted by Python']
+  measurement_timestamp timestamptz [note: 'When the peak/metric occurred']
+  
+  Note: 'STORAGE ENGINE: Hybrid/Delta Lake. High-frequency telemetry payloads back-ended in S3 Parquet format.'
+}
+
+Table cbm_predictive_alert {
+  alert_uuid varchar [primary key]
+  asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific part predicted to fail']
+  alert_timestamp timestamptz
+  
+  // The Prediction
+  predicted_failure_mode_uuid varchar [ref: > fmea_failure_mode.mode_uuid]
+  predicted_time_to_failure_hours float [note: 'Remaining Useful Life (RUL) prediction']
+  confidence_score float [note: 'Algorithm confidence (e.g., 0.88)']
+  
+  // Link to Action
+  resulting_discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'Nullable. If the alert triggers a proactive maintenance action.']
+  
+  Note: 'The core CBM output: Proactive alerts generated by ML models based on sensor trends.'
+}
+
+Table spend_plan_execution {
+  spend_uuid varchar [primary key]
+  invoice_number varchar
+  invoice_date date
+  amount_invoiced float
+  narrative text [note: 'General description of the work billed']
+  
+  // The Cybernetic Link: Tying Money to Engineering
+  linked_project_uuid varchar [ref: > engineering_project.project_uuid, note: 'Nullable. If funds were spent on a specific engineering improvement project.']
+  linked_fracas_uuid varchar [ref: > fracas_investigation.fracas_uuid, note: 'Nullable. If funds were spent investigating a failure.']
+  
+  Note: 'Tracks actual financial execution.'
+}
+
+Table financial_execution_link {
+  link_uuid varchar [primary key]
+  spend_uuid varchar [ref: > spend_plan_execution.spend_uuid]
+  
+  // The Polymorphic Link (Only ONE of these should be populated per row)
+  linked_project_uuid varchar [ref: > engineering_project.project_uuid, note: 'Proactive Projects']
+  linked_fracas_uuid varchar [ref: > fracas_investigation.fracas_uuid, note: 'Root Cause Investigations']
+  linked_instruction_uuid varchar [ref: > engineering_instruction.instruction_uuid, note: 'Temporary Instructions']
+  linked_ei_uuid varchar [ref: > engineering_investigation.ei_uuid, note: 'Hardware Teardowns']
+  linked_tech_manual_change_request_uuid varchar [ref: > tech_manual_change_request.tech_manual_change_request_uuid, note: 'Manual Deficiency Fixes']
+  
+  // Apportionment
+  apportioned_amount float [note: 'How much of the total invoice applied to this specific action']
+  
+  Note: 'Allows script to map specific dollars to specific engineering deliverables.'
+}
+
+Table labor_clocking {
+  clocking_uuid varchar [primary key]
+  transaction_id varchar [unique, note: 'The raw ID from the database']
+  maintainer_uuid varchar [ref: > maintainer.maintainer_uuid, note: 'The person logging the time']
+  
+  // Time Data
+  work_date date [not null]
+  hours_clocked float [not null, note: 'e.g., 4.5 hours']
+  labor_category varchar [note: 'e.g.,  Engineer, Artisan, Tech, QA']
+  
+  // The Polymorphic Link (What were they working on?)
+  linked_action_uuid varchar [ref: > maintenance_action.action_uuid, note: 'Wrench Time']
+  linked_ei_uuid varchar [ref: > engineering_investigation.ei_uuid, note: 'Depot Teardown / Investigation Time']
+  linked_instruction_uuid varchar [ref: > engineering_instruction.instruction_uuid, note: ' Engineering Time']
+  linked_fracas_uuid varchar [ref: > fracas_investigation.fracas_uuid, note: 'Data Analysis Time']
+  linked_project_uuid varchar [ref: > engineering_project.project_uuid, note: 'Proactive Engineering Time']
+  Note: 'The master ledger of human labor hours.'
+}
+
+Table flight_clearance_record {
+  clearance_uuid varchar [primary key]
+  clearance_number varchar [unique, not null]
+  clearance_type varchar 
+  issue_date date [not null]
+  expiration_date date
+  
+  // What does this clearance apply to?
+  aircraft_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'Nullable. If issued for a specific Tail number.']
+  linked_instruction_uuid varchar [ref: > engineering_instruction.instruction_uuid, note: 'Nullable. If issued to clear a temporary repair.']
+  
+  // Operating Limitations (Linking back to our earlier tables)
+  authorized_op_limit_uuid varchar [ref: > operating_limit.op_limit_uuid, note: 'The specific flight envelope restrictions applied']
+  
+  Note: 'The master log of engineering flight certifications.'
+}
+
+Table database_sync_log {
+  sync_uuid varchar [primary key]
+  local_device_id varchar [not null, note: 'Unique ID of your local dev/fleet computer']
+  sync_timestamp timestamptz [not null]
+  records_uploaded integer [not null]
+  sync_status varchar [note: 'Success, Failed, Conflict Resolved']
+  last_reconciled_transaction_uuid varchar [note: 'Pointer to the last successfully merged record']
+  Note: 'Ensures database integrity and auditability during offline operations.'
+}
+
+Table uas_contingency_event {
+  event_uuid varchar [primary key]
+  flight_uuid varchar [ref: > flight_log.flight_uuid]
+  contingency_type varchar [note: 'Lost Link, GPS Degraded, Fuel Dump, Autonomous Return-to-Home']
+  trigger_timestamp timestamptz [not null]
+  resolution_timestamp timestamptz [note: 'When the aircraft recovered or landed']
+  max_exceedance_value float [note: 'If the aircraft exceeded an Op Limit during recovery']
+  related_op_limit_uuid varchar [ref: > operating_limit.op_limit_uuid, note: 'Links the event to the Op Limit busted during the emergency maneuver']
+  Note: 'Logs autonomous emergency recovery events to assess high-fatigue stress on the airframe.'
+}
+
+Table document_repository {
+  doc_uuid varchar [primary key]
+  document_title varchar [not null]
+  document_type varchar [note: 'e.g., White Paper, Trade Study, Briefing, Test Report, Analysis Model']
+  author varchar [note: 'The  engineer or team who created it']
+  
+  // Version Control
+  revision varchar [note: 'e.g., v1.0, Rev B, DRAFT']
+  publication_date date
+  
+  // Storage
+  storage_location varchar [not null, note: 'S3 URI path to the actual PDF, PPTX, XLSX file']
+  keywords text [note: 'Searchable keywords for the AI to use']
+  
+  Note: 'A version-controlled library for all artifacts and engineering knowledge.'
+}
+
+Table document_linkage {
+  link_uuid varchar [primary key]
+  doc_uuid varchar [ref: > document_repository.doc_uuid]
+  
+  // Polymorphic Link to any other entity in the database
+  linked_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'Nullable. If the doc is about a specific part.']
+  linked_project_uuid varchar [ref: > engineering_project.project_uuid, note: 'Nullable. If it was the output of a project.']
+  linked_fracas_uuid varchar [ref: > fracas_investigation.fracas_uuid, note: 'Nullable. If it was part of a failure investigation.']
+  linked_td_uuid varchar [ref: > technical_directive.td_uuid, note: 'Links to official TD publications/blueprints']
+  linked_ei_uuid varchar [ref: > engineering_investigation.ei_uuid, note: 'Links to physical teardown lab reports']
+  linked_instruction_uuid varchar [ref: > engineering_instruction.instruction_uuid, note: 'Links to temporary repair instructions']
+  linked_pdr_uuid varchar [ref: > product_deficiency_report.pdr_uuid, note: 'Links to vendor teardown or quality lab reports']
+  Note: 'Connects unstructured knowledge (documents) to the structured AMIS data.'
+}
+
+Table product_deficiency_report {
+  pdr_uuid varchar [primary key]
+  report_number varchar [unique, not null]
+  discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'The maintenance event where the defect was found']
+  failed_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific defective serialized part']
+  
+  // Quality & Supply Data
+  submission_date date
+  category varchar [note: 'Category 1 (Safety Impact) or Category 2 (Routine Defect)']
+  defect_narrative text [note: 'Plain English description of the manufacturing flaw']
+  manufacturer_cage_code varchar [note: 'The vendor who built the defective part']
+  contract_number varchar [note: 'The contract under which the part was procured']
+  
+  // Resolution
+  status varchar [note: 'Open, Under Exhibit Review, Closed - Validated, Closed - Unsubstantiated']
+  financial_recoupment_amount float [note: 'Dollars recovered from the vendor for the defective part']
+  
+  Note: 'Tracks manufacturing defects and vendor quality issues.'
+}
+
+Table supply_requisition {
+  requisition_uuid varchar [primary key]
+  document_number varchar [unique, not null]
+  discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'The failure that triggered this parts order']
+  part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The part being ordered']
+  
+  // Requisition Status 
+  status_code varchar [note: 'e.g., Released, Backordered, Delayed']
+  priority_designator varchar [note: 'High, Routine']
+  quantity_ordered integer [default: 1]
+  order_date date
+  estimated_delivery_date date
+  actual_delivery_date date
+  
+  Note: 'Tracks parts requisitions and supply chain delays.'
+}
+
+Table software_release {
+  release_uuid varchar [primary key]
+  part_uuid varchar [ref: > part_catalog.part_uuid, note: 'Links to the software part number (e.g., SALE v4.2.1)']
+  release_date date
+  airworthiness_certification_date date [note: 'When the TAA cleared this software for flight']
+  is_active boolean [note: 'Is this the current fleet-approved version?']
+  
+  Note: 'The master log of certified software releases.'
+}
+
+Table software_change_log {
+  changelog_uuid varchar [primary key]
+  release_uuid varchar [ref: > software_release.release_uuid]
+  
+  // The Polymorphic Link (What gripe did this fix?)
+  linked_pr_uuid varchar [ref: > design_problem_report.pr_uuid, note: 'Nullable. A Jira issue fixed in this release.']
+  linked_fracas_uuid varchar [ref: > fracas_investigation.fracas_uuid, note: 'Nullable. A fleet failure fixed by this code update.']
+  linked_td_uuid varchar [ref: > technical_directive.td_uuid, note: 'Nullable. The formal TD directing the fleet to install this software.']
+  
+  change_description text [note: 'Plain English description of the code change or bug fix']
+  
+  Note: 'Maps specific engineering gripes/Jira tickets to the exact software release that fixed them.'
+}
+
+Table lessons_learned {
+  lesson_uuid varchar [primary key]
+  submitter_uuid varchar [ref: > maintainer.maintainer_uuid, note: 'The Engineer/Maintainer capturing the knowledge']
+  date_recorded date [not null]
+  
+  // Categorization
+  category varchar [note: 'e.g., Design Surprise, Maintenance Workaround, Software Behavior, Supply Chain']
+  severity_impact varchar [note: 'Critical (Must Know), Moderate (Helpful), Minor (Observation)']
+  
+  // The Knowledge
+  title varchar [not null]
+  observation_narrative text [note: 'What happened? (e.g., "The actuator seal degraded 3x faster in high-humidity environments.")']
+  root_cause_summary text [note: 'Why did it happen? (e.g., "Saltwater intrusion bypassed the secondary O-ring.")']
+  recommended_action text [note: 'What should we do differently? (e.g., "Update the FMEA to account for salt air, and increase inspection frequency.")']
+  
+  // AI/Search Optimization
+  keywords text [note: 'Comma-separated tags for RAG retrieval']
+  
+  Note: 'The master repository for engineering surprises, workarounds, and tribal knowledge.'
+}
+
+Table lesson_evidence_link {
+  link_uuid varchar [primary key]
+  lesson_uuid varchar [ref: > lessons_learned.lesson_uuid]
+  
+  // Polymorphic Links (What triggered this lesson?)
+  linked_fracas_uuid varchar [ref: > fracas_investigation.fracas_uuid, note: 'Nullable. Tied to a specific failure analysis.']
+  linked_project_uuid varchar [ref: > engineering_project.project_uuid, note: 'Nullable. Tied to an engineering study.']
+  linked_discrepancy_uuid varchar [ref: > maintenance_discrepancy.discrepancy_uuid, note: 'Nullable. Tied to a weird flight line event.']
+  linked_software_release_uuid varchar [ref: > software_release.release_uuid, note: 'Nullable. Tied to unexpected software behavior.']
+  linked_part_uuid varchar [ref: > part_catalog.part_uuid, note: 'Nullable. If the lesson is about a specific hardware design.']
+  
+  Note: 'Bridges the abstract lesson learned to the hard database evidence that proved it.'
+}
+
+Table corrosion_zone_catalog {
+  zone_uuid varchar [primary key]
+  zone_name varchar [unique, not null]
+  corrosion_severity_index float [not null, note: 'The numerical rating from studies (e.g., 1.0 to 10.0)']
+  primary_corrosion_type varchar [note: 'e.g., Saline, Industrial, High Humidity']
+  source_study_reference varchar [note: 'Link to the report that defined this zone']
+  Note: 'The master dictionary of geographic and climatic corrosion severity zones.'
+}
+
+Table aircraft_deployment_log {
+  deployment_uuid varchar [primary key]
+  aircraft_asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific Tail number being tracked']
+  corrosion_zone_uuid varchar [ref: > corrosion_zone_catalog.zone_uuid]
+  entry_date date [not null]
+  exit_date date [note: 'NULL if the aircraft is currently in this zone']
+  Note: 'Chronological log of an aircrafts physical operating environment.'
+}
+
+Table asset_corrosion_exposure_ledger {
+  exposure_uuid varchar [primary key]
+  asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific serialized part (e.g., a wing spar)']
+  last_calculated_date timestamptz [not null]
+  
+  // The Calculated Corrosion "Health"
+  cumulative_corrosion_score float [not null, note: 'The total exposure score since the last major inspection/wash']
+  predicted_inspection_due_date date [note: 'Date when the score is predicted to hit a critical threshold']
+  
+  // Link to Action
+  last_wash_action_uuid varchar [ref: > maintenance_action.action_uuid, note: 'The last wash/corrosion inspection that reset the score']
+  
+  Note: 'The dynamic ledger tracking the environmental stress on each critical component, calculated by script.'
+}
+
+Table support_equipment_catalog {
+  se_uuid varchar [primary key]
+  se_part_number varchar [unique, not null, note: 'The tool/equipment model number']
+  se_name varchar [not null, note: 'e.g., Hydraulic Mobile Test Stand, Digital Torque Wrench']
+  calibration_required boolean [default: false]
+  calibration_interval_months integer
+  Note: 'Dictionary of specialized Support Equipment (SE) required for maintenance.'
+}
+
+Table support_equipment_instance {
+  se_instance_uuid varchar [primary key]
+  se_uuid varchar [ref: > support_equipment_catalog.se_uuid]
+  se_serial_number varchar [unique, not null, note: 'The specific tool S/N']
+  last_calibration_date date
+  next_calibration_due_date date
+  status_code varchar [note: 'Ready for Use, Broken, Out of Calibration']
+  Note: 'Physical inventory of specific tools in the fleet and their calibration status.'
+}
+
+Table maintenance_se_usage {
+  usage_uuid varchar [primary key]
+  action_uuid varchar [ref: > maintenance_action.action_uuid, note: 'The maintenance event where the tool was used']
+  se_instance_uuid varchar [ref: > support_equipment_instance.se_instance_uuid]
+  Note: 'Logs which specific tools and torque wrenches were used on which maintenance actions.'
+}
+
+Table structural_fatigue_baseline {
+  baseline_uuid varchar [primary key]
+  part_uuid varchar [ref: > part_catalog.part_uuid, note: 'The structural component']
+    
+  // The Engineering Limits
+  fatigue_life_limit_hours float [note: 'The absolute maximum flight hours before mandatory replacement']
+  fatigue_life_limit_events integer 
+  crack_growth_rate float [note: 'Calculated da/dN (rate of crack propagation) for structural models']
+  critical_crack_length_inches float [note: 'The size at which a crack causes catastrophic failure']
+  
+  Note: 'The mathematical structural baselines extracted from Strength and Life Reports.'
+}
+
+Table structural_ndi_log {
+  ndi_uuid varchar [primary key]
+  action_uuid varchar [ref: > maintenance_action.action_uuid, note: 'The maintenance event where the inspection occurred']
+  asset_uuid varchar [ref: > asset_instance.asset_uuid, note: 'The specific serialized part inspected']
+  
+  // Inspection Details
+  inspection_method varchar [note: 'Visual, Eddy Current, Ultrasonic, Dye Penetrant, X-Ray']
+  crack_detected boolean [default: false]
+  crack_length_inches float [note: 'Nullable. Populated if a crack is found.']
+  crack_location_description text [note: 'Where on the part the crack was found']
+  
+  Note: 'Tracks structural inspections to feed crack-growth data back to engineering.'
